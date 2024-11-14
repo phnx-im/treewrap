@@ -6,7 +6,8 @@ use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyIn
 use hkdf::Hkdf;
 use sha2::Sha256;
 use treemath::{
-    direct_path, left, right, root, LeafNodeIndex, ParentNodeIndex, TreeNodeIndex, TreeSize,
+    direct_path, left, right, root, sibling, LeafNodeIndex, ParentNodeIndex, TreeNodeIndex,
+    TreeSize,
 };
 
 use crate::treemath::parent;
@@ -65,22 +66,23 @@ impl LeafNodePlaintext {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ParentNodePlaintext {
-    left_key: AesKey,
-    right_key: AesKey,
+    /*  left_key: AesKey,
+    right_key: AesKey, */
+    key: AesKey,
 }
 
 impl ParentNodePlaintext {
     fn serialize(&self) -> [u8; 64] {
         let mut buffer = [0u8; 64];
-        buffer[..32].copy_from_slice(&self.left_key);
-        buffer[32..].copy_from_slice(&self.right_key);
+        buffer[..32].copy_from_slice(&self.key);
+        //buffer[32..].copy_from_slice(&self.right_key);
         buffer
     }
 
     fn deserialize(buffer: &[u8; 64]) -> Self {
         Self {
-            left_key: buffer[..32].try_into().unwrap(),
-            right_key: buffer[32..].try_into().unwrap(),
+            key: buffer[..32].try_into().unwrap(),
+            //right_key: buffer[32..].try_into().unwrap(),
         }
     }
 }
@@ -226,28 +228,22 @@ impl WrappingTree {
             TreeNodeIndex::Parent(p) => {
                 // If the parent node is present in the public tree, we decrypt it
                 // and store it in the tree. We also extract the keys for the children.
-                let (left_key, right_key) =
-                    if let Some(ciphertext) = public_tree.parent_nodes[p.usize()] {
-                        println!("Decrypting parent node {} with key {:?}", p.usize(), key);
-                        let node = self.decrypt_parent_node(ciphertext, &key);
-                        let left_key = node.content.as_ref().map(|c| c.plaintext.left_key).unwrap();
-                        let right_key = node
-                            .content
-                            .as_ref()
-                            .map(|c| c.plaintext.right_key)
-                            .unwrap();
-                        self.parent_nodes[p.usize()] = node;
-                        (left_key, right_key)
-                    } else {
-                        // If it is blank, we just return the current key
-                        (key, key)
-                    };
+                let node_key = if let Some(ciphertext) = public_tree.parent_nodes[p.usize()] {
+                    println!("Decrypting parent node {} with key {:?}", p.usize(), key);
+                    let node = self.decrypt_parent_node(ciphertext, &key);
+                    let node_key = node.content.as_ref().map(|c| c.plaintext.key).unwrap();
+                    self.parent_nodes[p.usize()] = node;
+                    node_key
+                } else {
+                    // If it is blank, we just return the current key
+                    key
+                };
                 // We continue to navigate down the tree until we reach the
                 // leaves
                 let left_child = left(p);
                 let right_child = right(p);
-                self.expand_nodes(left_child, left_key, public_tree);
-                self.expand_nodes(right_child, right_key, public_tree);
+                self.expand_nodes(left_child, node_key, public_tree);
+                self.expand_nodes(right_child, node_key, public_tree);
             }
         }
     }
@@ -285,8 +281,8 @@ impl WrappingTree {
 
         // Re-encrypt the root node
         match root(self.size()) {
-            TreeNodeIndex::Leaf(l) => self.rewrap_leaf(l),
-            TreeNodeIndex::Parent(p) => self.rewrap_parent(p),
+            TreeNodeIndex::Leaf(l) => self.rewrap_leaf(l, None),
+            TreeNodeIndex::Parent(p) => self.rewrap_parent(p, None),
         }
     }
 
@@ -370,10 +366,6 @@ impl WrappingTree {
         if self.leaf_nodes.len() > 1 {
             println!("Wrapping up from node {:?}", index);
             self.wrap_up(index)
-        } else {
-            // If the tree only has one node, we rewrap it since it's the root
-            println!("Rewrapping root/leaf node after removal");
-            self.rewrap_leaf(LeafNodeIndex::new(0));
         }
 
         let tree_size = TreeSize::from_leaf_count(self.leaf_nodes.len());
@@ -391,23 +383,32 @@ impl WrappingTree {
         }
     }
 
-    fn rewrap_leaf(&mut self, index: LeafNodeIndex) {
+    fn rewrap_leaf(&mut self, index: LeafNodeIndex, key: Option<AesKey>) {
         if index.usize() >= self.leaf_nodes.len() {
             println!("Rewrap leaf: Index is outside the tree, nothing to do");
             // The index is outside the tree, nothing to do
             return;
         }
 
-        let key = derive_node_key(&self.init_secret, TreeNodeIndex::Leaf(index));
-
-        println!("Rewrapping leaf node {:?}", index);
-
         if let Some(ref leaf_node) = self.leaf_nodes[index.usize()].content {
+            println!("Rewrapping leaf node {:?}", index);
+            match key {
+                Some(k) => println!("\t with provided key {:?}", k),
+                None => println!(
+                    "\t with derived key {:?}",
+                    derive_node_key(&self.init_secret, TreeNodeIndex::Leaf(index))
+                ),
+            }
+
+            let key = key.unwrap_or(derive_node_key(
+                &self.init_secret,
+                TreeNodeIndex::Leaf(index),
+            ));
             self.leaf_nodes[index.usize()] = encrypt_leaf_node(&key, leaf_node.plaintext.clone());
         }
     }
 
-    fn rewrap_parent(&mut self, index: ParentNodeIndex) {
+    fn rewrap_parent(&mut self, index: ParentNodeIndex, key: Option<AesKey>) {
         println!("Rewrapping parent node {:?}", index);
         if index.usize() >= self.parent_nodes.len() {
             println!("Rewrap parent: Index is outside the tree, nothing to do");
@@ -415,28 +416,43 @@ impl WrappingTree {
             return;
         }
 
+        match key {
+            Some(k) => {
+                println!("\t with provided key {:?}", k);
+            }
+            None => {
+                println!(
+                    "\t with derived key {:?}",
+                    derive_node_key(&self.init_secret, TreeNodeIndex::Parent(index))
+                );
+            }
+        }
+
         let res = self.resolution(TreeNodeIndex::Parent(index));
 
         match res {
             Resolution::Empty => {
-                panic!("rewrap_parent: Resolution is empty");
+                println!("Rewrap parent: Resolution is empty");
             }
             Resolution::One(child) => {
                 println!("Rewrapping partial parent node {:?}", child);
 
                 match child {
                     TreeNodeIndex::Leaf(leaf_node_index) => {
-                        self.rewrap_leaf(leaf_node_index);
+                        self.rewrap_leaf(leaf_node_index, key);
                     }
                     TreeNodeIndex::Parent(parent_node_index) => {
-                        self.rewrap_parent(parent_node_index);
+                        self.rewrap_parent(parent_node_index, key);
                     }
                 }
             }
             Resolution::Both(_, _) => {
-                let key = derive_node_key(&self.init_secret, TreeNodeIndex::Parent(index));
-
+                let key = key.unwrap_or(derive_node_key(
+                    &self.init_secret,
+                    TreeNodeIndex::Parent(index),
+                ));
                 println!("Rewrapping full parent node {:?}", index);
+                println!("\t with key {:?}", key);
 
                 if let Some(ref parent_node) = self.parent_nodes[index.usize()].content {
                     self.parent_nodes[index.usize()] =
@@ -450,7 +466,23 @@ impl WrappingTree {
     /// This function will rewrap the parent nodes up to the root and skip
     /// the nodes that only have one child.
     fn wrap_up(&mut self, index: LeafNodeIndex) {
-        let root = root(self.size());
+        // We rewrap the sibling if it exists
+        match self.filtered_sibling(index) {
+            TreeNodeIndex::Leaf(leaf_node_index) => {
+                println!(
+                    "--> Rewrap the sibling of node {:?}: {:?}",
+                    index, leaf_node_index
+                );
+                self.rewrap_leaf(leaf_node_index, None);
+            }
+            TreeNodeIndex::Parent(parent_node_index) => {
+                println!(
+                    "--> Rewrap the sibling of node {:?}: {:?}",
+                    index, parent_node_index
+                );
+                self.rewrap_parent(parent_node_index, None);
+            }
+        }
 
         if index.usize() >= self.leaf_nodes.len() {
             println!("Wrap up: Index is outside the tree, nothing to do");
@@ -458,118 +490,89 @@ impl WrappingTree {
             return;
         }
 
-        let mut last_index = TreeNodeIndex::Leaf(index);
-        let mut last_key = derive_node_key(&self.init_secret, last_index);
+        let mut last_key = derive_node_key(&self.init_secret, index.into());
+        println!("Starting wrap up with key {:?}", last_key);
 
         // We check the resolution of the nodes in the direct path and either
-        // skip or rewrap them
+        // skip or rewrap them, including the resolution of their sibling nodes
         for node_index in direct_path(index, self.size()) {
+            let key = derive_node_key(&self.init_secret, node_index.into());
+            let mut sibling_key = None;
+
+            let sibling = sibling(node_index.into());
             match self.resolution(node_index.into()) {
                 Resolution::Empty => {
                     // The node is blank, nothing to do
-                    continue;
+                    println!("Wrap up: empty with node {:?}", node_index);
+                    //continue;
                 }
-                Resolution::One(child) => {
+                Resolution::One(_) => {
                     println!("Wrap up: one with node {:?}", node_index);
-                    // The node has only one child, we need to skip it
-                    // and we blank it, unless it is the root node.
-                    if TreeNodeIndex::from(node_index) != root {
-                        // Extract the keys from the parent node
-                        if let Some(node_content) =
-                            self.parent_nodes[node_index.usize()].content.as_ref()
-                        {
-                            last_key = if child.u32() < TreeNodeIndex::from(node_index).u32() {
-                                // The child was on the left, hence we keep the left key
-                                println!("\tThe child was on the left");
-                                node_content.plaintext.left_key
-                            } else {
-                                // The child was on the right, hence we keep the right key
-                                println!("\tThe child was on the right");
-                                node_content.plaintext.right_key
-                            };
-                            println!("\tExtracting key from parent node {:?}", last_key);
-                        }
 
-                        println!("\tBlanking node {:?}", node_index);
-                        self.parent_nodes[node_index.usize()] = ParentNode { content: None };
+                    self.parent_nodes[node_index.usize()] = ParentNode { content: None };
 
-                        continue;
-                    } else {
-                        println!("Wrapped up to root node, but there is only one child");
-                        // Blank the root node
-                        self.parent_nodes[node_index.usize()] = ParentNode { content: None };
-                        // Rewrap child
-                        println!("\tRewrapping child node {:?}", child);
-                        match child {
-                            TreeNodeIndex::Leaf(leaf_node_index) => {
-                                self.rewrap_leaf(leaf_node_index);
-                            }
-                            TreeNodeIndex::Parent(parent_node_index) => {
-                                self.rewrap_parent(parent_node_index);
-                            }
-                        }
-
-                        break;
-                    }
+                    sibling_key = Some(last_key);
                 }
                 Resolution::Both(left_index, right_index) => {
-                    // The node has two children, we need to rewrap it. We only
-                    // want to derive a key for the node in the direct path and
-                    // keep the key for the other one.
-
                     println!(
                         "Wrap up: both with node {:?}\n\tLeft: {:?}\n\tRight: {:?}",
                         node_index, left_index, right_index
                     );
 
-                    let left_key;
-                    let right_key;
+                    let parent_node_plaintext = ParentNodePlaintext { key: last_key };
 
-                    if last_index.u32() < TreeNodeIndex::from(node_index).u32() {
-                        // We came from the left, hence we keep the right key
-                        println!("We came from the left");
-                        left_key = last_key;
-                        right_key = self
-                            .parent_nodes
-                            .get(node_index.usize())
-                            .and_then(|n| n.content.as_ref())
-                            .map(|c| c.plaintext.right_key)
-                            .unwrap_or_else(|| self.next_or_derive(right_index));
-                    // find next key instead
-                    } else {
-                        // We came from the right, hence we keep the left key
-                        println!("We came from the right");
-                        left_key = self
-                            .parent_nodes
-                            .get(node_index.usize())
-                            .and_then(|n| n.content.as_ref())
-                            .map(|c| c.plaintext.left_key)
-                            .unwrap_or_else(|| self.next_or_derive(left_index));
-                        right_key = last_key;
-                    }
+                    self.parent_nodes[node_index.usize()] =
+                        encrypt_parent_node(&key, parent_node_plaintext);
 
-                    println!(
-                        "Parent node {:?}: \n\tLeft key: {:?}, \n\tRight key: {:?}",
-                        node_index, left_key, right_key
-                    );
+                    sibling_key = Some(last_key);
 
-                    let parent_node_plaintext = ParentNodePlaintext {
-                        left_key,
-                        right_key,
-                    };
-
-                    // Encrypt the two keys and store the new parent node
-                    last_key = derive_node_key(&self.init_secret, node_index.into());
-                    println!(
-                        "Encrypting parent node {} with key {:?}",
-                        node_index.usize(),
-                        last_key
-                    );
-                    let new_node = encrypt_parent_node(&last_key, parent_node_plaintext);
-                    self.parent_nodes[node_index.usize()] = new_node;
+                    last_key = key;
                 }
             }
-            last_index = node_index.into();
+            // Encrypt the sibling if it exists, unless it's the root
+            if TreeNodeIndex::Parent(node_index) != root(self.size()) {
+                println!(
+                    "Encrypt the sibling of node {:?}: {:?}",
+                    node_index, sibling
+                );
+                println!("\t with key {:?}", last_key);
+                match sibling {
+                    TreeNodeIndex::Leaf(leaf_node_index) => {
+                        self.rewrap_leaf(leaf_node_index, sibling_key);
+                    }
+                    TreeNodeIndex::Parent(parent_node_index) => {
+                        self.rewrap_parent(parent_node_index, sibling_key);
+                    }
+                }
+            }
+
+            //println!("Derive a new key: {:?}", last_key);
+        }
+    }
+
+    // Returns the first non-blank parent node in the path to the root. If the
+    // root is blank, it will return the root.
+    fn filtered_parent(&self, index: LeafNodeIndex) -> ParentNodeIndex {
+        let mut p = parent(TreeNodeIndex::Leaf(index));
+        let root = root(self.size());
+
+        while TreeNodeIndex::Parent(p) != root
+            && self.parent_nodes[parent(p.into()).usize()]
+                .content
+                .is_none()
+        {
+            p = parent(p.into());
+        }
+
+        p
+    }
+
+    fn filtered_sibling(&self, index: LeafNodeIndex) -> TreeNodeIndex {
+        let p = self.filtered_parent(index);
+        if index.u32() > p.u32() {
+            left(p)
+        } else {
+            right(p)
         }
     }
 
@@ -589,36 +592,6 @@ impl WrappingTree {
         }
     }
 
-    /// Looks for the key in the next non-blank node in the direct path, if it
-    /// is not found we assume it must be the root node and we derive the key
-    fn next_or_derive(&self, index: TreeNodeIndex) -> AesKey {
-        let root = root(TreeSize::from_leaf_count(self.leaf_nodes.len()));
-        let mut path_index = index;
-
-        println!("next_or_derive: {:?}", index);
-
-        while path_index != root {
-            let parent = parent(path_index);
-            println!("Looking for key in node {:?}", parent);
-            if let Some(content) = &self.parent_nodes[parent.usize()].content {
-                if path_index > TreeNodeIndex::Parent(parent) {
-                    println!("Found right key");
-                    return content.plaintext.right_key;
-                } else {
-                    println!("Found left key");
-                    return content.plaintext.left_key;
-                }
-            }
-            path_index = TreeNodeIndex::Parent(parent);
-        }
-        println!(
-            "Deriving key for index {:?}: {:?}",
-            index,
-            derive_node_key(&self.init_secret, index)
-        );
-        derive_node_key(&self.init_secret, index)
-    }
-
     /// Export the init secret
     pub fn export_root_secret(&self) -> &InitSecret {
         &self.init_secret
@@ -635,9 +608,10 @@ impl WrappingTree {
 }
 
 fn derive_node_key(init_secret: &InitSecret, index: TreeNodeIndex) -> AesKey {
+    let parent = parent(index);
     let mut key = [0u8; 32];
     let hk = Hkdf::<Sha256>::from_prk(init_secret).unwrap();
-    hk.expand(&index.u32().to_be_bytes(), &mut key).unwrap();
+    hk.expand(&parent.u32().to_be_bytes(), &mut key).unwrap();
     key
 }
 
@@ -789,7 +763,7 @@ fn fuzz() {
         assert_eq!(leaf_node_plaintexts, new_leaf_node_plaintexts);
     }
 
-    const LEAF_COUNT: u32 = 32;
+    const LEAF_COUNT: u32 = 4;
     const OPERATION_COUNT: usize = 100;
     const EPOCH_COUNT: usize = 10;
 
@@ -835,9 +809,12 @@ fn pathological_case2() {
         mac: [2u8; 32],
     };
 
+    println!("---Adding node");
     tree.add(LeafNodeIndex::new(3), leaf_node_plaintext.clone());
+    println!("---Adding node");
+    tree.add(LeafNodeIndex::new(2), leaf_node_plaintext.clone());
+    println!("---Adding node");
     tree.add(LeafNodeIndex::new(1), leaf_node_plaintext.clone());
-    tree.add(LeafNodeIndex::new(0), leaf_node_plaintext.clone());
 
     println!("First tree: {:?}", tree.export_public_tree().leaf_nodes);
 
@@ -863,12 +840,14 @@ fn pathological_case2() {
 
     println!("Second tree: {:?}", tree.export_public_tree().leaf_nodes);
 
-    let remove_node = 0;
-
+    let remove_node = 3;
     println!("Removing node {}", remove_node);
-
     tree.remove(LeafNodeIndex::new(remove_node));
+    println!("Node {} removed", remove_node);
 
+    let remove_node = 2;
+    println!("Removing node {}", remove_node);
+    tree.remove(LeafNodeIndex::new(remove_node));
     println!("Node {} removed", remove_node);
 
     println!("Third tree: {:?}", tree.export_public_tree().leaf_nodes);

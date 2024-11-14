@@ -51,6 +51,11 @@ impl ParentNodeIndex {
         self.0 as usize
     }
 
+    /// Return the inner value as `u32`.
+    pub(crate) fn u32(&self) -> u32 {
+        self.0
+    }
+
     /// Return the index as a TreeNodeIndex value.
     fn to_tree_index(self) -> u32 {
         self.0 * 2 + 1
@@ -207,6 +212,15 @@ pub(crate) fn parent(x: TreeNodeIndex) -> ParentNodeIndex {
     let b = (x >> (k + 1)) & 0x01;
     let index = (x | (1 << k)) ^ (b << (k + 1));
     ParentNodeIndex::from_tree_index(index)
+}
+
+pub(crate) fn sibling(index: TreeNodeIndex) -> TreeNodeIndex {
+    let p = parent(index);
+    match index.u32().cmp(&p.to_tree_index()) {
+        Ordering::Less => right(p),
+        Ordering::Greater => left(p),
+        Ordering::Equal => left(p),
+    }
 }
 
 /// Direct path from a node to the root.
