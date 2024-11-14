@@ -134,7 +134,10 @@ impl TreeSize {
 
     /// Creates a new `TreeSize` from a specific leaf count
     pub(crate) fn from_leaf_count(leaf_count: usize) -> Self {
-        TreeSize::new((leaf_count * 2 - 1) as u32)
+        match leaf_count {
+            0 => TreeSize::new(1),
+            _ => TreeSize::new((leaf_count * 2 - 1) as u32),
+        }
     }
 
     /// Return the number of leaf nodes in the tree.
